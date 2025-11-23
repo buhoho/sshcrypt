@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""
+sshcrypt - Encrypt/decrypt files using SSH Agent
+Simple and elegant file encryption using SSH keys.
+"""
+
+import sys
+import os
+import tempfile
+import subprocess
+import hashlib
+import struct
+import socket
+from pathlib import Path
+
+
+# 固定文字列 (署名用)
+MAGIC = b"sshcrypt-v1"
+
+
+class SSHAgent:
+    """SSH Agent との通信"""
+    
+    SSH_AGENTC_REQUEST_IDENTITIES = 11
+    SSH_AGENT_IDENTITIES_ANSWER = 12
+    SSH_AGENTC_SIGN_REQUEST = 13
+    SSH_AGENT_SIGN_RESPONSE = 14
+    
+    def __init__(self):
+        self.sock_path = os.environ.get('SSH_AUTH_SOCK')
+        if not self.sock_path:
+            raise RuntimeError("SSH_AUTH_SOCK not set. Is ssh-agent running?")
+    
+    def _send(self, msg):
+        """メッセージを SSH Agent に送信"""
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(self.sock_path)
+        
+        # メッセージ長 + メッセージ
+        msg_len = struct.pack('>I', len(msg))
+        sock.sendall(msg_len + msg)
+        
+        # レスポンス受信
+        resp_len = struct.unpack('>I', sock.recv(4))[0]
+        resp = sock.recv(resp_len)
+        sock.close()
+        return resp
+    
+    def get_identities(self):
+        """SSH Agent から鍵のリストを取得"""
+        msg = bytes([self.SSH_AGENTC_REQUEST_IDENTITIES])
+        resp = self._send(msg)
+        
+        if resp[0] != self.SSH_AGENT_IDENTITIES_ANSWER:
+            raise RuntimeError("Failed to get identities")
+        
+        # 鍵の数
+        num_keys = struct.unpack('>I', resp[1:5])[0]
+        
+        keys = []
+        offset = 5
+        for _ in range(num_keys):
+            # 鍵の長さ
+            key_len = struct.unpack('>I', resp[offset:offset+4])[0]
+            offset += 4
+            
+            # 鍵データ
+            key_blob = resp[offset:offset+key_len]
+            offset += key_len
+            
+            # コメントの長さ
+            comment_len = struct.unpack('>I', resp[offset:offset+4])[0]
+            offset += 4
+            
+            # コメント
+            comment = resp[offset:offset+comment_len].decode('utf-8', errors='ignore')
+            offset += comment_len
+            
+            keys.append({'blob': key_blob, 'comment': comment})
+        
+        return keys
+    
+    def sign(self, key_blob, data):
+        """SSH Agent に署名を依頼"""
+        # メッセージ構築
+        msg = bytes([self.SSH_AGENTC_SIGN_REQUEST])
+        msg += struct.pack('>I', len(key_blob)) + key_blob
+        msg += struct.pack('>I', len(data)) + data
+        msg += struct.pack('>I', 0)  # flags
+        
+        resp = self._send(msg)
+        
+        if resp[0] != self.SSH_AGENT_SIGN_RESPONSE:
+            raise RuntimeError("Failed to sign data")
+        
+        # 署名の長さ
+        sig_len = struct.unpack('>I', resp[1:5])[0]
+        signature = resp[5:5+sig_len]
+        
+        return signature
+
+
+def encrypt_file(plaintext_path, encrypted_path):
+    """ファイルを暗号化"""
+    agent = SSHAgent()
+    keys = agent.get_identities()
+    
+    if not keys:
+        print("Error: No SSH keys found in agent", file=sys.stderr)
+        sys.exit(1)
+    
+    # 最初の鍵を使用
+    key = keys[0]
+    print(f"Using key: {key['comment']}", file=sys.stderr)
+    
+    # SSH Agent に署名させる (固定文字列を署名)
+    signature = agent.sign(key['blob'], MAGIC)
+    
+    # 署名から AES 鍵を導出
+    aes_key = hashlib.sha256(signature).digest()
+    
+    # openssl で暗号化
+    with open(plaintext_path, 'rb') as f:
+        plaintext = f.read()
+    
+    # openssl を使って暗号化
+    proc = subprocess.Popen(
+        ['openssl', 'enc', '-aes-256-cbc', '-pbkdf2', '-pass', 'stdin'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    
+    encrypted, stderr = proc.communicate(input=aes_key.hex().encode() + b'\n' + plaintext)
+    
+    if proc.returncode != 0:
+        print(f"Error: openssl encryption failed: {stderr.decode()}", file=sys.stderr)
+        sys.exit(1)
+    
+    # ファイルに保存: key_blob_len + key_blob + 暗号化データ
+    with open(encrypted_path, 'wb') as f:
+        f.write(struct.pack('>I', len(key['blob'])))
+        f.write(key['blob'])
+        f.write(encrypted)
+    
+    print(f"Encrypted: {plaintext_path} -> {encrypted_path}", file=sys.stderr)
+
+
+def decrypt_file(encrypted_path, plaintext_path):
+    """ファイルを復号"""
+    agent = SSHAgent()
+    
+    with open(encrypted_path, 'rb') as f:
+        # ヘッダー読み取り
+        key_blob_len = struct.unpack('>I', f.read(4))[0]
+        key_blob = f.read(key_blob_len)
+        
+        # 暗号化データ
+        encrypted = f.read()
+    
+    # SSH Agent に署名させる (固定文字列を署名)
+    signature = agent.sign(key_blob, MAGIC)
+    
+    # 署名から AES 鍵を導出
+    aes_key = hashlib.sha256(signature).digest()
+    
+    # openssl で復号
+    proc = subprocess.Popen(
+        ['openssl', 'enc', '-d', '-aes-256-cbc', '-pbkdf2', '-pass', 'stdin'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    
+    plaintext, stderr = proc.communicate(input=aes_key.hex().encode() + b'\n' + encrypted)
+    
+    if proc.returncode != 0:
+        print(f"Error: openssl decryption failed: {stderr.decode()}", file=sys.stderr)
+        sys.exit(1)
+    
+    with open(plaintext_path, 'wb') as f:
+        f.write(plaintext)
+    
+    print(f"Decrypted: {encrypted_path} -> {plaintext_path}", file=sys.stderr)
+
+
+def edit_file(file_path):
+    """ファイルを編集"""
+    editor = os.environ.get('EDITOR', 'vim')
+    
+    # ファイルが存在するか確認
+    if not Path(file_path).exists():
+        # 新規ファイル: 空の一時ファイルを作成して編集
+        print(f"Creating new file: {file_path}", file=sys.stderr)
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.txt')
+        os.close(tmp_fd)
+        
+        # エディタで編集
+        subprocess.run([editor, tmp_path])
+        
+        # 暗号化して保存
+        if Path(tmp_path).stat().st_size > 0:
+            encrypt_file(tmp_path, file_path)
+        else:
+            print("Empty file, not saving.", file=sys.stderr)
+        
+        os.unlink(tmp_path)
+        return
+    
+    # 既存ファイル: 復号 → 編集 → 再暗号化
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.txt')
+    os.close(tmp_fd)
+    
+    try:
+        # 復号
+        decrypt_file(file_path, tmp_path)
+        
+        # エディタで編集
+        subprocess.run([editor, tmp_path])
+        
+        # 再暗号化
+        encrypt_file(tmp_path, file_path)
+        
+    finally:
+        # 一時ファイル削除
+        if Path(tmp_path).exists():
+            os.unlink(tmp_path)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage:", file=sys.stderr)
+        print("  sshcrypt encrypt <plaintext> <encrypted>", file=sys.stderr)
+        print("  sshcrypt decrypt <encrypted> <plaintext>", file=sys.stderr)
+        print("  sshcrypt edit <file>", file=sys.stderr)
+        sys.exit(1)
+    
+    command = sys.argv[1]
+    
+    try:
+        if command == 'encrypt':
+            if len(sys.argv) != 4:
+                print("Usage: sshcrypt encrypt <plaintext> <encrypted>", file=sys.stderr)
+                sys.exit(1)
+            encrypt_file(sys.argv[2], sys.argv[3])
+        
+        elif command == 'decrypt':
+            if len(sys.argv) != 4:
+                print("Usage: sshcrypt decrypt <encrypted> <plaintext>", file=sys.stderr)
+                sys.exit(1)
+            decrypt_file(sys.argv[2], sys.argv[3])
+        
+        elif command == 'edit':
+            if len(sys.argv) != 3:
+                print("Usage: sshcrypt edit <file>", file=sys.stderr)
+                sys.exit(1)
+            edit_file(sys.argv[2])
+        
+        else:
+            print(f"Unknown command: {command}", file=sys.stderr)
+            print("Valid commands: encrypt, decrypt, edit", file=sys.stderr)
+            sys.exit(1)
+    
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
