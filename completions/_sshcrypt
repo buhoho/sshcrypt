@@ -1,0 +1,25 @@
+#compdef sshcrypt
+
+_sshcrypt() {
+  local -a commands
+  commands=(
+    'encrypt:Encrypt a file'
+    'decrypt:Decrypt a file'
+    'edit:Edit an encrypted file'
+  )
+  
+  if (( CURRENT == 2 )); then
+    _describe 'command' commands
+  elif (( CURRENT == 3 )); then
+    case "$words[2]" in
+      edit|decrypt)
+        _files -g "*.sshcrypt"
+        ;;
+      encrypt)
+        _files
+        ;;
+    esac
+  fi
+}
+
+_sshcrypt "$@"
