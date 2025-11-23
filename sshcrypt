@@ -106,8 +106,7 @@ def encrypt_file(plaintext_path, encrypted_path):
     keys = agent.get_identities()
     
     if not keys:
-        print("Error: No SSH keys found in agent", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("No SSH keys found in agent")
     
     # 最初の鍵を使用
     key = keys[0]
@@ -134,8 +133,7 @@ def encrypt_file(plaintext_path, encrypted_path):
     encrypted, stderr = proc.communicate(input=aes_key.hex().encode() + b'\n' + plaintext)
     
     if proc.returncode != 0:
-        print(f"Error: openssl encryption failed: {stderr.decode()}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"openssl encryption failed: {stderr.decode()}")
     
     # ファイルに保存: key_blob_len + key_blob + 暗号化データ
     with open(encrypted_path, 'wb') as f:
@@ -175,8 +173,7 @@ def decrypt_file(encrypted_path, plaintext_path):
     plaintext, stderr = proc.communicate(input=aes_key.hex().encode() + b'\n' + encrypted)
     
     if proc.returncode != 0:
-        print(f"Error: openssl decryption failed: {stderr.decode()}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"openssl decryption failed: {stderr.decode()}")
     
     with open(plaintext_path, 'wb') as f:
         f.write(plaintext)
@@ -187,44 +184,53 @@ def decrypt_file(encrypted_path, plaintext_path):
 def edit_file(file_path):
     """ファイルを編集"""
     editor = os.environ.get('EDITOR', 'vim')
-    
-    # ファイルが存在するか確認
-    if not Path(file_path).exists():
-        # 新規ファイル: 空の一時ファイルを作成して編集
-        print(f"Creating new file: {file_path}", file=sys.stderr)
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.txt')
-        os.close(tmp_fd)
-        
-        # エディタで編集
-        subprocess.run([editor, tmp_path])
-        
-        # 暗号化して保存
-        if Path(tmp_path).stat().st_size > 0:
-            encrypt_file(tmp_path, file_path)
-        else:
-            print("Empty file, not saving.", file=sys.stderr)
-        
-        os.unlink(tmp_path)
-        return
-    
-    # 既存ファイル: 復号 → 編集 → 再暗号化
     tmp_fd, tmp_path = tempfile.mkstemp(suffix='.txt')
     os.close(tmp_fd)
     
     try:
-        # 復号
-        decrypt_file(file_path, tmp_path)
+        # 既存ファイルなら復号
+        if Path(file_path).exists():
+            decrypt_file(file_path, tmp_path)
+        else:
+            print(f"Creating new file: {file_path}", file=sys.stderr)
         
         # エディタで編集
         subprocess.run([editor, tmp_path])
         
-        # 再暗号化
-        encrypt_file(tmp_path, file_path)
+        # 暗号化リトライループ
+        while True:
+            try:
+                encrypt_file(tmp_path, file_path)
+                break  # 成功したらループ抜ける
+            except Exception as e:
+                print(f"\nError: Failed to encrypt", file=sys.stderr)
+                print(f"  {e}", file=sys.stderr)
+                print("\nPlease fix SSH Agent:", file=sys.stderr)
+                print("  - Start: eval $(ssh-agent -s)", file=sys.stderr)
+                print("  - Load key: ssh-add ~/.ssh/id_ed25519", file=sys.stderr)
+                print("\nPress Enter to retry...", file=sys.stderr)
         
+                try:
+                    input()
+                    # エディタ再起動
+                    subprocess.run([editor, tmp_path])
+                except KeyboardInterrupt:
+                    # 1回目の Ctrl+C: 警告
+                    print("\n\nWarning: Pressing Ctrl+C again will DELETE the temp file permanently.", file=sys.stderr)
+                    print(f"Temp file location: {tmp_path}", file=sys.stderr)
+                    print("\nIf you need to save it, copy it now.", file=sys.stderr)
+                    print("Press Enter to continue editing, or Ctrl+C again to delete and exit.", file=sys.stderr)
+                    try:
+                        input()
+                        # エディタ再起動
+                        subprocess.run([editor, tmp_path])
+                    except KeyboardInterrupt:
+                        # 2回目の Ctrl+C: ループを抜けて終了
+                        print("\nDeleting temp file and exiting. Your original encrypted file is untouched.", file=sys.stderr)
+                        break
     finally:
         # 一時ファイル削除
-        if Path(tmp_path).exists():
-            os.unlink(tmp_path)
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 def main():
