@@ -112,10 +112,20 @@ def encrypt_file(plaintext_path, encrypted_path):
     key = keys[0]
     print(f"Using key: {key['comment']}", file=sys.stderr)
     
-    # SSH Agent に署名させる (固定文字列を署名)
-    signature = agent.sign(key['blob'], MAGIC)
+    # 署名が決定論的かチェック (非決定論的な鍵は使えない)
+    print("Checking if signature is deterministic...", file=sys.stderr)
+    sig1 = agent.sign(key['blob'], MAGIC)
+    sig2 = agent.sign(key['blob'], MAGIC)
+    
+    if sig1 != sig2:
+        raise RuntimeError(
+            "Your SSH key produces non-deterministic signatures.\n"
+            "Encrypted files will be unrecoverable with this key.\n"
+            "Please use RSA or Ed25519 keys, or update your SSH agent."
+        )
     
     # 署名から AES 鍵を導出
+    signature = sig1  # 既に取得済み
     aes_key = hashlib.sha256(signature).digest()
     
     # openssl で暗号化
